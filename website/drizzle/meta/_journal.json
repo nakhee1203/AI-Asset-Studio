@@ -8,6 +8,13 @@
       "when": 1793775758119,
       "tag": "0000_awesome_gladiator",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1793781708987,
+      "tag": "0001_revised_prompt",
+      "breakpoints": true
     }
   ]
 }

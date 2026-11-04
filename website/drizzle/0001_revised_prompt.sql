@@ -1,0 +1,1 @@
+ALTER TABLE `studio_versions` ADD `revised_prompt` text;

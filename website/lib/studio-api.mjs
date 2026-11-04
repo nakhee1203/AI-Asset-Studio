@@ -1,5 +1,5 @@
 import {validateProject,activeInput} from '../public/studio/model.js';
-import {TEXT_MODEL,IMAGE_MODEL,MONTHLY_LIMIT,IMAGE_RESERVATION,MAX_IMAGE_BYTES,uid,now,month,fail,string,id,initialWorkflow,discussionRequest,textReservation,textUsage,imageUsage,responseText,validateTurn,validateDraft,planAssets,sha256,imageSize} from './studio-domain.mjs';
+import {TEXT_MODEL,IMAGE_MODEL,MONTHLY_LIMIT,IMAGE_RESERVATION,MAX_IMAGE_BYTES,uid,now,month,fail,string,id,initialWorkflow,discussionRequest,textReservation,textUsage,imageUsage,responseText,validateTurn,validateDraft,planAssets,sha256,imageSize,editPrompt,IMAGE_TOOL_INSTRUCTION} from './studio-domain.mjs';
 import {checkSelections,createExport} from './studio-export.mjs';
 const ACTIVE=['submitting','running','processing'];
 const json=(value,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -26,7 +26,8 @@ async function detail(db,p){
  const cost=await first(db,'SELECT COALESCE(SUM(COALESCE(actual_micro,reservation_micro)),0) AS projectCost FROM studio_jobs WHERE project_id=? AND owner=?',p.id,p.owner);
  const monthly=await first(db,'SELECT COALESCE(SUM(COALESCE(actual_micro,reservation_micro)),0) AS cost FROM studio_jobs WHERE owner=? AND (billing_month=? OR actual_micro IS NULL)',p.owner,month());
  const job=p.workflow.activeJob?await first(db,'SELECT * FROM studio_jobs WHERE id=? AND owner=?',p.workflow.activeJob,p.owner):null;
- return {project:summary(p),workflow:p.workflow,job:safeJob(job),assets:assets.map(a=>({id:a.id,kind:a.kind,label:a.label,refs:JSON.parse(a.refs_json),selectedVersion:a.selected_version,finalVersion:a.final_version,versions:versions.filter(v=>v.asset_id===a.id).map(v=>({id:v.id,url:'/api/images/'+v.id,prompt:v.prompt,parentVersion:v.parent_version,refs:JSON.parse(v.refs_json),createdAt:v.created_at}))})),budget:{projectMicro:p.budget_micro,usedMicro:cost.projectCost,monthlyMicro:MONTHLY_LIMIT,monthlyUsedMicro:monthly.cost,imageEstimateMicro:IMAGE_RESERVATION}};
+ const excluded=new Set(p.workflow.excluded??[]);
+ return {project:summary(p),workflow:p.workflow,job:safeJob(job),assets:assets.map(a=>({id:a.id,kind:a.kind,label:a.label,prompt:a.prompt,excluded:excluded.has(a.id),refs:JSON.parse(a.refs_json),selectedVersion:a.selected_version,finalVersion:a.final_version,versions:versions.filter(v=>v.asset_id===a.id).map(v=>({id:v.id,url:'/api/images/'+v.id,prompt:v.prompt,revisedPrompt:v.revised_prompt??null,parentVersion:v.parent_version,refs:JSON.parse(v.refs_json),createdAt:v.created_at}))})),budget:{projectMicro:p.budget_micro,usedMicro:cost.projectCost,monthlyMicro:MONTHLY_LIMIT,monthlyUsedMicro:monthly.cost,imageEstimateMicro:IMAGE_RESERVATION}};
 }
 async function commit(db,p,workflow,extra=()=>[],input=p.input){
  const token=uid();workflow={...workflow,mutation:token};
@@ -111,20 +112,20 @@ async function pollJob(db,env,owner,jobId){
   let additional=()=>[];
   if(job.kind==='interview'){
    const turn=validateTurn(JSON.parse(responseText(response)));
-   workflow.messages=[...p.workflow.messages,{role:'assistant',text:turn.message,questions:turn.questions}];
-   workflow.draft=turn.draft;workflow.readyForReview=turn.readyForReview;
+   workflow.messages=[...p.workflow.messages,{role:'assistant',text:turn.message,questions:turn.questions,changes:turn.changes}];
+   workflow.draft=turn.draft;workflow.readyForReview=turn.readyForReview;workflow.draftWarning=turn.draftWarning;
   }else{
    const calls=(response.output??[]).filter(o=>o.type==='image_generation_call'&&o.result);
    if(calls.length!==1)fail('이미지 한 장의 생성 결과를 확인하지 못했습니다.');
-   const encoded=calls[0].result;
+   const encoded=calls[0].result,revised=typeof calls[0].revised_prompt==='string'?calls[0].revised_prompt.slice(0,8000):null;
    if(typeof encoded!=='string'||encoded.length>Math.ceil(MAX_IMAGE_BYTES/3)*4+4)fail('이미지가 허용 크기를 넘었습니다.');
    const bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));
    if(bytes.length<8||[137,80,78,71,13,10,26,10].some((n,i)=>bytes[i]!==n))fail('올바른 PNG 이미지가 아닙니다.');
    const objectKey=owner+'/'+p.id+'/'+saved.snapshotId+'/'+job.id+'.png';
    await env.BUCKET.put(objectKey,bytes,{httpMetadata:{contentType:'image/png'}});
    const hash=await sha256(bytes);
-   additional=(guard,args)=>[stmt(db,`INSERT OR IGNORE INTO studio_versions (id,asset_id,project_id,owner,snapshot_id,object_key,mime,sha256,bytes,prompt,parent_version,refs_json,created_at)
-    SELECT ?,?,?,?,?,?,'image/png',?,?,?,?,?,? WHERE `+guard,job.id,saved.assetId,p.id,owner,saved.snapshotId,objectKey,hash,bytes.length,saved.prompt,saved.parentVersion??null,JSON.stringify(saved.refs),now(),...args)];
+   additional=(guard,args)=>[stmt(db,`INSERT OR IGNORE INTO studio_versions (id,asset_id,project_id,owner,snapshot_id,object_key,mime,sha256,bytes,prompt,revised_prompt,parent_version,refs_json,created_at)
+    SELECT ?,?,?,?,?,?,'image/png',?,?,?,?,?,?,? WHERE `+guard,job.id,saved.assetId,p.id,owner,saved.snapshotId,objectKey,hash,bytes.length,saved.prompt,revised,saved.parentVersion??null,JSON.stringify(saved.refs),now(),...args)];
   }
   await commit(db,p,workflow,(guard,args)=>[...additional(guard,args),stmt(db,"UPDATE studio_jobs SET status='completed',actual_micro=?,updated_at=? WHERE id=? AND owner=? AND "+guard,cost,now(),job.id,owner,...args)]);
  }catch(error){
@@ -135,21 +136,25 @@ async function pollJob(db,env,owner,jobId){
 async function imageRequest(db,env,p,body){
  if(!['assets','complete'].includes(p.workflow.stage)||!p.workflow.snapshotId)fail('기획을 먼저 확정해 주세요.',409);
  if(body.acknowledgeEstimate!==true)fail('이미지 생성 예상 비용을 확인해 주세요.');
- const {assets,versions}=await loadAssets(db,p),asset=assets.find(a=>a.id===body.assetId);
+ const {assets,versions}=await loadAssets(db,p),asset=assets.find(a=>a.id===body.assetId),excluded=new Set(p.workflow.excluded??[]);
  if(!asset)fail('에셋을 찾을 수 없습니다.',404);
+ if(excluded.has(asset.id))fail('제외한 에셋입니다. 다시 포함한 뒤 생성해 주세요.',409);
  const snapshot=await first(db,'SELECT * FROM studio_snapshots WHERE id=? AND owner=?',p.workflow.snapshotId,p.owner);
  const draft=JSON.parse(snapshot.data_json).draft;
  const feedback=string(body.feedback??'','수정 요청',3000);
  const parent=body.parentVersion?versions.find(v=>v.id===body.parentVersion&&v.asset_id===asset.id):null;
  if(body.parentVersion&&!parent)fail('수정할 원본을 찾을 수 없습니다.',404);
+ if(parent&&!feedback)fail('선택한 이미지를 수정하려면 바꾸고 싶은 부분을 적어 주세요.');
  const refs=JSON.parse(asset.refs_json).map(refId=>{
   const refAsset=assets.find(a=>a.id===refId),version=versions.find(v=>v.id===refAsset?.selected_version);
+  if(!refAsset||excluded.has(refAsset.id))fail('이 장면이 참조하는 에셋이 제외되었습니다. 참조 에셋을 다시 포함해 주세요.',409);
   if(!version)fail('캐릭터·장소·소품 이미지를 먼저 만들고 선택해 주세요.',409);
   return {assetId:refId,versionId:version.id};
  });
  if(parent&&JSON.stringify(JSON.parse(parent.refs_json))!==JSON.stringify(refs))fail('참조가 바뀐 이미지는 새 참조로 다시 생성해 주세요.',409);
  const inputs=parent?[parent]:refs.map(r=>versions.find(v=>v.id===r.versionId));
- const prompt=asset.prompt+(parent?'\nEdit the supplied image. Preserve all other details.':'')+(feedback?'\nUSER DIRECTION: '+feedback:'');
+ // 편집은 짧은 지시만, 새 생성은 저장된 에셋 프롬프트(사용자가 고쳤을 수 있음)+추가 방향.
+ const prompt=parent?editPrompt(feedback):asset.prompt+(feedback?'\nUSER DIRECTION: '+feedback:'');
  const content=[{type:'input_text',text:prompt}];
  for(const version of inputs){
   const object=await env.BUCKET.get(version.object_key);if(!object)fail('참조 이미지 파일이 없습니다.',409);
@@ -158,7 +163,7 @@ async function imageRequest(db,env,p,body){
   let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));
   content.push({type:'input_image',image_url:'data:image/png;base64,'+btoa(binary)});
  }
- const request={model:TEXT_MODEL,reasoning:{effort:'none'},background:true,store:true,max_output_tokens:2048,max_tool_calls:1,input:[{role:'user',content}],tool_choice:{type:'image_generation'},tools:[{type:'image_generation',model:IMAGE_MODEL,action:inputs.length?'edit':'generate',size:imageSize(draft.aspectRatio),quality:'medium',output_format:'png',background:'opaque',partial_images:0}]};
+ const request={model:TEXT_MODEL,reasoning:{effort:'none'},background:true,store:true,max_output_tokens:2048,max_tool_calls:1,input:[{role:'developer',content:IMAGE_TOOL_INSTRUCTION},{role:'user',content}],tool_choice:{type:'image_generation'},tools:[{type:'image_generation',model:IMAGE_MODEL,action:inputs.length?'edit':'generate',size:imageSize(draft.aspectRatio,asset.kind),quality:'medium',output_format:'png',background:'opaque',partial_images:0}]};
  return {request,input:{assetId:asset.id,snapshotId:p.workflow.snapshotId,prompt,parentVersion:parent?.id??null,refs,acknowledgedEstimate:true}};
 }
 async function readBody(request){
@@ -222,7 +227,7 @@ export async function handleApi(request,env){
   if(action==='confirm-plan'){
    if(p.workflow.stage!=='interview'||!p.workflow.readyForReview)fail('기획 초안을 먼저 검토해 주세요.',409);
    const draft=validateDraft(p.workflow.draft),snapshotId=uid(),assets=planAssets(draft,snapshotId,p.id,owner);
-   p=await commit(db,p,{...p.workflow,stage:'assets',snapshotId},(guard,args)=>[
+   p=await commit(db,p,{...p.workflow,stage:'assets',snapshotId,excluded:[],draftWarning:null},(guard,args)=>[
     stmt(db,'INSERT INTO studio_snapshots (id,project_id,owner,data_json,created_at) SELECT ?,?,?,?,? WHERE '+guard,snapshotId,p.id,owner,JSON.stringify({draft,input:p.input}),now(),...args),
     ...assets.map(a=>stmt(db,'INSERT INTO studio_assets (id,project_id,owner,snapshot_id,kind,label,prompt,refs_json) SELECT ?,?,?,?,?,?,?,? WHERE '+guard,a.id,p.id,owner,snapshotId,a.kind,a.label,a.prompt,JSON.stringify(a.refs),...args))
    ]);return json(await detail(db,p));
@@ -236,8 +241,36 @@ export async function handleApi(request,env){
    ]);return json(await detail(db,p));
   }
   if(action==='confirm-assets'){
-   const {assets,versions}=await loadAssets(db,p);if(!assets.length)fail('확정할 에셋이 없습니다.',409);checkSelections(assets,versions);
-   p=await commit(db,p,{...p.workflow,stage:'complete'},(guard,args)=>[stmt(db,'UPDATE studio_assets SET final_version=selected_version WHERE project_id=? AND owner=? AND snapshot_id=? AND '+guard,p.id,owner,p.workflow.snapshotId,...args)]);
+   const {assets,versions}=await loadAssets(db,p),excluded=[...new Set(p.workflow.excluded??[])],active=assets.filter(a=>!excluded.includes(a.id));
+   if(!active.length)fail('확정할 에셋이 없습니다.',409);checkSelections(active,versions);
+   p=await commit(db,p,{...p.workflow,stage:'complete'},(guard,args)=>[stmt(db,'UPDATE studio_assets SET final_version=selected_version WHERE project_id=? AND owner=? AND snapshot_id=? AND '+guard,p.id,owner,p.workflow.snapshotId,...args),...excluded.map(assetId=>stmt(db,'UPDATE studio_assets SET final_version=NULL WHERE id=? AND owner=? AND '+guard,assetId,owner,...args))]);
+   return json(await detail(db,p));
+  }
+  if(action==='edit-draft'){
+   if(p.workflow.stage!=='interview')fail('확정한 기획은 입력 내용 수정에서 새 대화로 바꿀 수 있습니다.',409);
+   const draft=validateDraft(body.draft);
+   p=await commit(db,p,{...p.workflow,draft,readyForReview:true,draftWarning:null});return json(await detail(db,p));
+  }
+  if(action==='edit-prompt'){
+   if(!['assets','complete'].includes(p.workflow.stage))fail('기획을 먼저 확정해 주세요.',409);
+   const {assets}=await loadAssets(db,p),asset=assets.find(a=>a.id===body.assetId);if(!asset)fail('에셋을 찾을 수 없습니다.',404);
+   const prompt=string(body.prompt,'프롬프트',6000);if(!prompt)fail('프롬프트를 입력해 주세요.');
+   p=await commit(db,p,p.workflow,(guard,args)=>[stmt(db,'UPDATE studio_assets SET prompt=? WHERE id=? AND owner=? AND '+guard,prompt,asset.id,owner,...args)]);return json(await detail(db,p));
+  }
+  if(action==='exclude'){
+   // 제외는 참조 관계를 깨지 않는 범위에서만. 장면이 참조하는 기준 에셋은 장면을 먼저 제외해야 뺄 수 있다.
+   if(!['assets','complete'].includes(p.workflow.stage))fail('기획을 먼저 확정해 주세요.',409);
+   const {assets}=await loadAssets(db,p),asset=assets.find(a=>a.id===body.assetId);if(!asset)fail('에셋을 찾을 수 없습니다.',404);
+   const excluded=new Set(p.workflow.excluded??[]);
+   if(body.excluded===true){
+    const dependent=assets.find(a=>!excluded.has(a.id)&&a.id!==asset.id&&JSON.parse(a.refs_json).includes(asset.id));
+    if(dependent)fail('"'+dependent.label+'" 장면이 이 에셋을 참조합니다. 그 장면을 먼저 제외해 주세요.',409);
+    excluded.add(asset.id);
+   }else if(body.excluded===false){
+    if(JSON.parse(asset.refs_json).some(refId=>excluded.has(refId)))fail('이 장면이 참조하는 에셋이 아직 제외되어 있습니다. 참조 에셋을 먼저 포함해 주세요.',409);
+    excluded.delete(asset.id);
+   }else fail('제외 여부를 확인해 주세요.');
+   p=await commit(db,p,{...p.workflow,stage:'assets',excluded:[...excluded]},(guard,args)=>[stmt(db,'UPDATE studio_assets SET final_version=NULL WHERE project_id=? AND owner=? AND snapshot_id=? AND '+guard,p.id,owner,p.workflow.snapshotId,...args)]);
    return json(await detail(db,p));
   }
   if(action==='export'){
